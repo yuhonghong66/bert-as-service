@@ -45,6 +45,7 @@ class BertServer(threading.Thread):
         self.processes = []
         self.frontend = None  # REQ->ROUTER
         self.backend = None  # PUSH->PULL
+        self.sink = None
         self.context = None
         self.exit_flag = threading.Event()
         self.logger = set_logger('DISPATCHER')
@@ -60,23 +61,27 @@ class BertServer(threading.Thread):
         self.exit_flag.set()
         self.frontend.close()
         self.backend.close()
+        self.sink.close()
         self.context.term()
         self.logger.info('terminated!')
 
     def run(self):
         self.context = zmq.Context()
+
+        # setup frontend
         self.frontend = self.context.socket(zmq.ROUTER)
         self.frontend.bind('tcp://*:%d' % self.port)
         # self.frontend.setsockopt(zmq.ROUTER_MANDATORY, 1)
 
+        # setup backend
         self.backend = self.context.socket(zmq.PUSH)
         self.backend.bind('ipc://*')
         backend_addr = self.backend.getsockopt(zmq.LAST_ENDPOINT).decode('ascii')
 
-        # start the sink thread
-        sink_thread = BertSink(self.args, self.client_checksum, self.finished_client)
-        sink_thread.start()
-        self.processes.append(sink_thread)
+        # setup sink
+        self.sink = self.context.socket(zmq.PULL)
+        self.sink.bind('ipc://*')
+        sink_addr = self.backend.getsockopt(zmq.LAST_ENDPOINT).decode('ascii')
 
         available_gpus = range(self.num_worker)
         try:
@@ -90,45 +95,76 @@ class BertServer(threading.Thread):
 
         # start the backend processes
         for i in available_gpus:
-            process = BertWorker(i, self.args, backend_addr, sink_thread.address)
+            process = BertWorker(i, self.args, backend_addr, sink_addr)
             self.processes.append(process)
             process.start()
 
+        # Set up a poller to multiplex the work receiver and control receiver channels
+        poller = zmq.Poller()
+        poller.register(self.sink, zmq.POLLIN)
+        poller.register(self.frontend, zmq.POLLIN)
+
+        pending_checksum = defaultdict(int)
+        pending_client = defaultdict(list)
+
         while not self.exit_flag.is_set():
-            for client, tmp in self.finished_client:
-                self.logger.info(
-                    'client %s %d samples are done! sending back to client' % (client, self.client_checksum[client]))
-                # re-sort to the original order
-                tmp = [x[0] for x in sorted(tmp, key=lambda x: x[1])]
-                send_ndarray(self.frontend, client, np.concatenate(tmp, axis=0))
-                self.client_checksum.pop(client)
+            socks = dict(poller.poll())
+            if socks.get(self.sink) == zmq.POLLIN:
+                msg = self.sink.recv_multipart()
+                client_id = msg[0]
 
-            client, _, msg = self.frontend.recv_multipart()
-            if msg == b'SHOW_CONFIG':
-                self.frontend.send_multipart(
-                    [client, b'',
-                     jsonapi.dumps({**{'client': client.decode('ascii'),
-                                       'num_process': len(self.processes),
-                                       'ipc_backend': backend_addr,
-                                       'ipc_sink': sink_thread.address}, **self.args_dict})])
-                continue
+                arr_info, arr_val = jsonapi.loads(msg[2]), msg[4]
+                X = np.frombuffer(memoryview(arr_val), dtype=arr_info['dtype'])
+                X = X.reshape(arr_info['shape'])
+                client_info = client_id.split(b'@')
+                client_id = client_info[0]
+                partial_id = client_info[1] if len(client_info) == 2 else 0
+                pending_client[client_id].append((X, partial_id))
+                pending_checksum[client_id] += X.shape[0]
+                self.logger.info('received %d of client %s (%d/%d)' % (X.shape[0], client_id,
+                                                                       pending_checksum[client_id],
+                                                                       self.client_checksum[client_id]))
+    
+                # check if there are finished jobs, send it back to workers
+                self.finished_client = [(k, v) for k, v in pending_client.items() if
+                                        pending_checksum[k] == self.client_checksum[k]]
 
-            seqs = pickle.loads(msg)
-            num_seqs = len(seqs)
-            self.client_checksum[client] = num_seqs
+                for client, tmp in self.finished_client:
+                    self.logger.info(
+                        'client %s %d samples are done! sending back to client' % (
+                        client, self.client_checksum[client]))
+                    # re-sort to the original order
+                    tmp = [x[0] for x in sorted(tmp, key=lambda x: x[1])]
+                    send_ndarray(self.frontend, client, np.concatenate(tmp, axis=0))
+                    self.client_checksum.pop(client)
 
-            if num_seqs > self.max_batch_size:
-                # divide the large batch into small batches
-                s_idx = 0
-                while s_idx < num_seqs:
-                    tmp = seqs[s_idx: (s_idx + self.max_batch_size)]
-                    if tmp:
-                        # get the worker with minimum workload
-                        client_partial_id = client + b'@%d' % s_idx
-                        self.backend.send_multipart([client_partial_id, b'', pickle.dumps(tmp, protocol=-1)])
-                    s_idx += len(tmp)
-            else:
-                self.backend.send_multipart([client, b'', msg])
+            if socks.get(self.frontend) == zmq.POLLIN:
+                client, _, msg = self.frontend.recv_multipart()
+                if msg == b'SHOW_CONFIG':
+                    self.frontend.send_multipart(
+                        [client, b'',
+                         jsonapi.dumps({**{'client': client.decode('ascii'),
+                                           'num_process': len(self.processes),
+                                           'ipc_backend': backend_addr,
+                                           'ipc_sink': sink_addr}, **self.args_dict})])
+                    continue
+
+                seqs = pickle.loads(msg)
+                num_seqs = len(seqs)
+                self.client_checksum[client] = num_seqs
+
+                if num_seqs > self.max_batch_size:
+                    # divide the large batch into small batches
+                    s_idx = 0
+                    while s_idx < num_seqs:
+                        tmp = seqs[s_idx: (s_idx + self.max_batch_size)]
+                        if tmp:
+                            # get the worker with minimum workload
+                            client_partial_id = client + b'@%d' % s_idx
+                            self.backend.send_multipart([client_partial_id, b'', pickle.dumps(tmp, protocol=-1)])
+                        s_idx += len(tmp)
+                else:
+                    self.backend.send_multipart([client, b'', msg])
 
         self.frontend.close()
         self.backend.close()
