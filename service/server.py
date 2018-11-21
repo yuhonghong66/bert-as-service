@@ -51,6 +51,7 @@ class BertServer(threading.Thread):
         self.client_checksum = {}
         self.pending_client = {}
         self.pending_checksum = {}
+        self.finished_client = []
 
     def close(self):
         self.logger.info('shutting down...')
@@ -73,7 +74,7 @@ class BertServer(threading.Thread):
         backend_addr = self.backend.getsockopt(zmq.LAST_ENDPOINT).decode('ascii')
 
         # start the sink thread
-        sink_thread = BertSink(self.args, self.client_checksum)
+        sink_thread = BertSink(self.args, self.client_checksum, self.finished_client)
         sink_thread.start()
         self.processes.append(sink_thread)
 
@@ -94,6 +95,14 @@ class BertServer(threading.Thread):
             process.start()
 
         while not self.exit_flag.is_set():
+            for client, tmp in self.finished_client:
+                self.logger.info(
+                    'client %s %d samples are done! sending back to client' % (client, self.client_checksum[client]))
+                # re-sort to the original order
+                tmp = [x[0] for x in sorted(tmp, key=lambda x: x[1])]
+                send_ndarray(self.frontend, client, np.concatenate(tmp, axis=0))
+                self.client_checksum.pop(client)
+
             client, _, msg = self.frontend.recv_multipart()
             if msg == b'SHOW_CONFIG':
                 self.frontend.send_multipart(
@@ -127,7 +136,7 @@ class BertServer(threading.Thread):
 
 
 class BertSink(threading.Thread):
-    def __init__(self, args, client_chk):
+    def __init__(self, args, client_chk, finished):
         super().__init__()
         self.port = args.port
         self.context = None
@@ -136,6 +145,7 @@ class BertSink(threading.Thread):
         self.logger = set_logger('SINK')
         self.address = None
         self.client_checksum = client_chk
+        self.finished_client = finished
 
     def close(self):
         self.logger.info('shutting down...')
@@ -144,10 +154,6 @@ class BertSink(threading.Thread):
 
     def run(self):
         self.context = zmq.Context()
-        self.frontend = self.context.socket(zmq.ROUTER)
-        self.frontend.connect('tcp://localhost:%d' % self.port)
-        self.frontend.setsockopt(zmq.ROUTER_MANDATORY, 1)
-
         self.receiver = self.context.socket(zmq.PULL)
         self.receiver.bind('ipc://*')
         self.address = self.receiver.getsockopt(zmq.LAST_ENDPOINT).decode('ascii')
@@ -172,16 +178,8 @@ class BertSink(threading.Thread):
                                                                    self.client_checksum[client_id]))
 
             # check if there are finished jobs, send it back to workers
-            finished = [(k, v) for k, v in pending_client.items() if pending_checksum[k] == self.client_checksum[k]]
-            for client, tmp in finished:
-                self.logger.info(
-                    'client %s %d samples are done! sending back to client' % (client, self.client_checksum[client]))
-                # re-sort to the original order
-                tmp = [x[0] for x in sorted(tmp, key=lambda x: x[1])]
-                send_ndarray(self.frontend, client, np.concatenate(tmp, axis=0))
-                pending_client.pop(client)
-                pending_checksum.pop(client)
-                self.client_checksum.pop(client)
+            self.finished_client = [(k, v) for k, v in pending_client.items() if
+                                    pending_checksum[k] == self.client_checksum[k]]
 
         self.receiver.close()
         self.context.term()
