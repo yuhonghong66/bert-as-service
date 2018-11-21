@@ -145,7 +145,7 @@ class BertSink(threading.Thread):
     def run(self):
         self.context = zmq.Context()
         self.frontend = self.context.socket(zmq.ROUTER)
-        self.frontend.connect('tcp://*:%d' % self.port)
+        self.frontend.connect('tcp://localhost:%d' % self.port)
         self.frontend.setsockopt(zmq.ROUTER_MANDATORY, 1)
 
         self.receiver = self.context.socket(zmq.PULL)
