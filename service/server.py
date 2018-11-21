@@ -77,7 +77,7 @@ class BertServer(threading.Thread):
         self.backend = self.context.socket(zmq.PUSH)
         self.backend.bind('ipc://*')
         backend_addr = self.backend.getsockopt(zmq.LAST_ENDPOINT).decode('ascii')
-
+        time.sleep(1)
         # setup sink
         self.sink = self.context.socket(zmq.PULL)
         self.sink.bind('ipc://*')
