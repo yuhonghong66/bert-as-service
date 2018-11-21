@@ -73,7 +73,7 @@ class BertServer(threading.Thread):
         backend_addr = self.backend.getsockopt(zmq.LAST_ENDPOINT).decode('ascii')
 
         # start the sink thread
-        sink_thread = BertSink(self.args, self.frontend, self.client_checksum)
+        sink_thread = BertSink(self.args, self.client_checksum)
         sink_thread.start()
         self.processes.append(sink_thread)
 
@@ -127,12 +127,11 @@ class BertServer(threading.Thread):
 
 
 class BertSink(threading.Thread):
-    def __init__(self, args, frontend, client_chk):
+    def __init__(self, args, client_chk):
         super().__init__()
         self.port = args.port
         self.context = None
         self.receiver = None
-        self.frontend = frontend
         self.exit_flag = threading.Event()
         self.logger = set_logger('SINK')
         self.address = None
@@ -145,9 +144,14 @@ class BertSink(threading.Thread):
 
     def run(self):
         self.context = zmq.Context()
+        self.frontend = self.context.socket(zmq.ROUTER)
+        self.frontend.connect('tcp://*:%d' % self.port)
+        self.frontend.setsockopt(zmq.ROUTER_MANDATORY, 1)
+
         self.receiver = self.context.socket(zmq.PULL)
         self.receiver.bind('ipc://*')
         self.address = self.receiver.getsockopt(zmq.LAST_ENDPOINT).decode('ascii')
+
         pending_checksum = defaultdict(int)
         pending_client = defaultdict(list)
 
